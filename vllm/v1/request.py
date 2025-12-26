@@ -136,6 +136,22 @@ class Request:
             self.block_hashes = self.get_hash_new_full_blocks()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+        
+        # --- [NETWORK-AWARE SCHEDULING MODIFICATION START] ---
+        # Per-request health factor (0.0 - 1.0)
+        # 每个请求独立的健康度，用于 per-user 算力分配
+        self.health_factor: float = 1.0
+        
+        # Control Signals (由 API 设置)
+        self.target_qps: float = -1.0  # R_net: 目标网络速率
+        self.dynamic_weight: float = 1.0  # W: 动态调度权重
+        
+        # Instrumentation / Metrics (用于计算 R_gpu)
+        self.total_tokens_generated: int = 0
+        self.gpu_execution_start_time: float = time.time()
+        self.last_stats_update_time: float = time.time()
+        self.active_time_cumulative: float = 0.0  # 累计有效计算时间
+        # --- [NETWORK-AWARE SCHEDULING MODIFICATION END] ---
 
     @classmethod
     def from_engine_core_request(
@@ -209,10 +225,10 @@ class Request:
     def get_finished_reason(self) -> FinishReason | None:
         return RequestStatus.get_finished_reason(self.status)
 
-    def get_num_encoder_embeds(self, input_id: int) -> int:
+    def get_num_encoder_tokens(self, input_id: int) -> int:
         assert input_id < len(self.mm_features)
-        num_embeds = self.mm_features[input_id].mm_position.get_num_embeds
-        return num_embeds
+        num_tokens = self.mm_features[input_id].mm_position.length
+        return num_tokens
 
     def record_event(
         self,
@@ -227,13 +243,58 @@ class Request:
         events, self.events = self.events, []
         return events
 
+    def get_actual_gpu_rate(self) -> float:
+        """
+        [NEW METHOD]
+        Calculates the actual generation rate (Tokens Per Second) 
+        based on active execution time.
+        
+        Formula: R_gpu = total_tokens_generated / max(active_time_cumulative, 0.001)
+        
+        Returns:
+            float: The actual GPU generation rate in tokens per second.
+                  Returns 0.0 if active_time_cumulative is too small.
+        """
+        if self.active_time_cumulative <= 0.001:
+            return 0.0
+        
+        return self.total_tokens_generated / self.active_time_cumulative
+    
+    def update_execution_stats(self, new_tokens: int, time_delta: float):
+        """
+        [NEW METHOD]
+        Called by the scheduler after a step is executed.
+        Updates the cumulative statistics for rate calculation.
+        
+        Args:
+            new_tokens: Number of new tokens generated in this step
+            time_delta: Time spent in active execution (in seconds)
+        """
+        self.total_tokens_generated += new_tokens
+        self.active_time_cumulative += time_delta
+        self.last_stats_update_time = time.time()
+    
     def __lt__(self, other: "Request") -> bool:
         """
         Compare two requests based on priority, arrival time, and request ID.
         Used in priority scheduling.
+        
+        [NETWORK-AWARE SCHEDULING MODIFICATION]
+        Modified to incorporate dynamic_weight for network-aware scheduling.
+        Higher dynamic_weight requests get higher priority (appear earlier).
         """
+        # --- [NETWORK-AWARE SCHEDULING MODIFICATION START] ---
+        # First compare by priority (existing behavior)
         if self.priority != other.priority:
             return self.priority < other.priority
+        
+        # Then compare by dynamic_weight (higher weight = higher priority)
+        # We use (1.0 / dynamic_weight) so that higher weight = smaller value = higher priority
+        if abs(self.dynamic_weight - other.dynamic_weight) > 1e-6:
+            return (1.0 / self.dynamic_weight) < (1.0 / other.dynamic_weight)
+        # --- [NETWORK-AWARE SCHEDULING MODIFICATION END] ---
+        
+        # Finally compare by arrival time (FCFS within same priority and weight)
         if self.arrival_time != other.arrival_time:
             return self.arrival_time < other.arrival_time
         if self.request_id != other.request_id:
