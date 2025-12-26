@@ -43,11 +43,9 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import (
-    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
-    FinishReason,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
@@ -217,6 +215,71 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+        # --- [NETWORK-AWARE SCHEDULING MODIFICATION START] ---
+        # Initialize background network pacer
+        self.hint_url = os.environ.get("VLLM_HINT_SERVER_URL", "http://localhost:5000/hint")
+        self.pacer_interval = float(os.environ.get("VLLM_PACER_INTERVAL", "0.2"))
+        self.pacer_running = True
+        
+        # 存储每个 client_index (user_id) 对应的健康度
+        self.per_user_health: dict[int, float] = {}
+        self.per_user_health_lock = threading.Lock()
+        
+        self.pacer_thread = threading.Thread(target=self._network_pacer_loop, daemon=True)
+        self.pacer_thread.start()
+        logger.info("Network-aware pacer thread started (per-user mode), querying: %s", self.hint_url)
+        # --- [NETWORK-AWARE SCHEDULING MODIFICATION END] ---
+
+    def _network_pacer_loop(self):
+        """Background loop to query Hint Server and update per-request health factors."""
+        import requests as http_requests
+        while self.pacer_running:
+            try:
+                # 更新全局健康度
+                resp = http_requests.get(self.hint_url, timeout=0.1)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    global_health = data.get("health", 1.0)
+                    # Update scheduler's global health factor
+                    if hasattr(self.scheduler, "set_health_factor"):
+                        self.scheduler.set_health_factor(global_health)
+                
+                # 更新每个用户的健康度
+                for user_id in [1, 2]:  # 支持的用户 ID
+                    try:
+                        resp = http_requests.get(f"{self.hint_url}?user_id={user_id}", timeout=0.1)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            health = data.get("health", 1.0)
+                            with self.per_user_health_lock:
+                                self.per_user_health[user_id] = health
+                    except Exception:
+                        pass
+                
+                # 更新所有运行中请求的健康度
+                if hasattr(self.scheduler, 'running'):
+                    with self.per_user_health_lock:
+                        for request in self.scheduler.running:
+                            # 从 request_id 解析 user_id (格式: "user{N}_xxx")
+                            user_id = self._extract_user_id(request.request_id)
+                            if user_id in self.per_user_health:
+                                request.health_factor = self.per_user_health[user_id]
+                            else:
+                                request.health_factor = global_health
+                                
+            except Exception as e:
+                # Silently fail, keep current factor
+                pass
+            time.sleep(self.pacer_interval)
+
+    def _extract_user_id(self, request_id: str) -> int:
+        """从 request_id 中提取 user_id (格式: 'user{N}_xxx')"""
+        import re
+        match = re.match(r'^user(\d+)_', request_id)
+        if match:
+            return int(match.group(1))
+        return 0  # 默认用户 ID
+
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
     ) -> tuple[int, int, KVCacheConfig]:
@@ -247,20 +310,9 @@ class EngineCore:
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
-        # Track max_model_len before KV cache config to detect auto-fit changes
-        max_model_len_before = vllm_config.model_config.max_model_len
-
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
-
-        # If auto-fit reduced max_model_len, sync the new value to workers.
-        # This is needed because workers were spawned before memory profiling
-        # and have the original (larger) max_model_len cached.
-        max_model_len_after = vllm_config.model_config.max_model_len
-        if max_model_len_after != max_model_len_before:
-            self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
-
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
@@ -936,13 +988,6 @@ class EngineCoreProc(EngineCore):
         # Post-step hook.
         self.post_step(model_executed)
 
-        # If no model execution happened but there are waiting requests
-        # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
-        # background threads (like NIXL handshake) to make progress.
-        # Without this, the tight polling loop can starve background threads.
-        if not model_executed and self.scheduler.has_unfinished_requests():
-            time.sleep(0.001)
-
         return model_executed
 
     def _handle_client_request(
@@ -1068,14 +1113,9 @@ class EngineCoreProc(EngineCore):
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
                     # Deserialize the request data.
-                    request: Any
                     if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
-                        try:
-                            request = self.preprocess_add_request(req)
-                        except Exception:
-                            self._handle_request_preproc_error(req)
-                            continue
+                        request = add_request_decoder.decode(data_frames)
+                        request = self.preprocess_add_request(request)
                     else:
                         request = generic_decoder.decode(data_frames)
 
@@ -1158,30 +1198,6 @@ class EngineCoreProc(EngineCore):
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
-
-    def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
-        """Log and return a request-scoped error response for exceptions raised
-        from the add request preprocessing in the input socket processing thread.
-        """
-        logger.exception(
-            "Unexpected error pre-processing request %s", request.request_id
-        )
-        self.output_queue.put_nowait(
-            (
-                request.client_index,
-                EngineCoreOutputs(
-                    engine_index=self.engine_index,
-                    finished_requests={request.request_id},
-                    outputs=[
-                        EngineCoreOutput(
-                            request_id=request.request_id,
-                            new_token_ids=[],
-                            finish_reason=FinishReason.ERROR,
-                        )
-                    ],
-                ),
-            )
-        )
 
 
 class DPEngineCoreProc(EngineCoreProc):
